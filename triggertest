@@ -1,0 +1,137 @@
+# import serial
+import numpy as np
+# import time
+import pyqtgraph as pg
+from PyQt6 import QtCore, QtWidgets
+# import tkinter as tk
+import threading
+import math
+import sys
+
+NUM_SAMPLES = 1250
+FREQ = 60
+PERIOD = math.ceil(1.0 / FREQ * 10000)
+
+trigger_value = 0.5
+trigger_type = "RE"
+wave = np.zeros(NUM_SAMPLES)
+double_size = np.zeros(NUM_SAMPLES * 2)
+output = np.zeros(NUM_SAMPLES)
+i = 0
+
+def get_next_chunk():
+    global wave
+    global i
+    for j in range(NUM_SAMPLES):
+        wave[j] = math.sin(2 * 3.14 * FREQ * i)
+        i = (i + 1)
+
+def find_trigger_point():
+    global trigger_value
+    global trigger_type
+    global double_size
+    if trigger_type == "RE":
+        for j in range(1, NUM_SAMPLES):
+            if double_size[j - 1] < trigger_value and double_size[j] >= trigger_value:
+                return j
+    elif trigger_type == "FE":
+        for j in range(1, NUM_SAMPLES):
+            if double_size[j - 1] >= trigger_value and double_size[j] < trigger_value:
+                return j
+    elif trigger_type == "FIRST":
+        for j in range(NUM_SAMPLES):
+            if double_size[j] >= trigger_value:
+                return j
+
+# def perform_shift(first_trig_index):
+#     global wave
+#     global shifted_wave
+#     i = first_trig_index
+#     for j in range(NUM_SAMPLES):
+#         shifted_wave[j] = wave[i]
+#         i = (i + 1) % NUM_SAMPLES
+
+def copy(src, dest, shift):
+    for j in range(NUM_SAMPLES):
+        dest[j + (shift * NUM_SAMPLES)] = src[j]
+
+# def plot_graph():
+#     global graph
+#     graph.exec() 
+
+# def test():
+
+#     global output
+
+#     while True:
+
+#         get_next_chunk()
+#         copy(wave, double_size, 0)
+#         get_next_chunk()
+#         copy(wave, double_size, 1)
+
+#         trigger_index = find_trigger_point()
+#         if (trigger_index):
+            
+#             output = double_size[trigger_index:trigger_index + NUM_SAMPLES - 1:1]
+
+#         else:
+#             # print("The function did not trigger the set trigger.")
+#             pass
+
+# test_thread = threading.Thread(target = test)
+# test_thread.start()
+
+class LiveGraph(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        global output
+
+        # 1. Initialize the PlotWidget
+        self.graphWidget = pg.PlotWidget()
+        self.setCentralWidget(self.graphWidget)
+        
+        #self.graphWidget.setBackground('w')
+        #pen = pg.mkPen(color=(255, 0, 0))
+        self.data_line = self.graphWidget.plot(output, pen='y')
+        
+        # 2. Setup the Timer
+        self.timer = QtCore.QTimer()
+        self.timer.setInterval(16) # Update every 50ms
+        self.timer.timeout.connect(self.update_plot_data)
+        self.timer.start()
+
+    def update_plot_data(self):
+
+        global output
+        # 3. Update data (scrolling effect)
+        # self.x = self.x[1:]  # Remove the first x element
+        # self.x.append(self.x[-1] + 1)  # Add a new x element
+        
+        # self.y = self.y[1:]  # Remove the first y element
+        # self.y.append(np.random.normal())  # Add new random data
+        
+        # 4. Set the new data to the plot line
+        global output
+
+        get_next_chunk()
+        copy(wave, double_size, 0)
+        get_next_chunk()
+        copy(wave, double_size, 1)
+
+        trigger_index = find_trigger_point()
+        if trigger_index is not None:
+            
+            output = double_size[trigger_index:trigger_index + NUM_SAMPLES:1]
+
+        else:
+            # print("The function did not trigger the set trigger.")
+            pass
+
+        self.data_line.setData(output)
+
+app = QtWidgets.QApplication(sys.argv)
+main = LiveGraph()
+main.show()
+sys.exit(app.exec())
