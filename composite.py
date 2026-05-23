@@ -27,8 +27,17 @@ VALID_CHARACTERS = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "."};
 
 stop_flag = 1 #When set, the script will not query the microcontroller for samples. #When not set, python script will indefinitely request samples.
 terminate_flag = 0 #Signals that the UI has been closed by the user and that the main thread must join all other threads and terminate.
+save_zero_flag = 0
+save_one_flag = 0
+return_recv_flag = 0
+latest_return_code = None
+output_buffer = None
+
+trigger_buffer0 = None
+trigger_buffer1 = None
 
 trigger_setting = 0
+trigger_type = "RE"
 
 total_bytes_read = 0
 wave0 = None #The array that holds one frame of data from channel 0. Size of NUM_SAMPLES constant.
@@ -77,13 +86,14 @@ def receive_samples():
 
 def wait_for_response():
     """Called after a command is sent to the microcontroller to catch the microcontroller's response."""
-    
+    global RETURN_CODES
+    global latest_return_code
+    global return_recv_flag
     #Read the one byte return code.
-    return_code = serial_obj.read(1)
+    latest_return_code = serial_obj.read(1)
+    return_recv_flag = 1
     #Print the code and its corresponding text to the terminal
-    print(f"[UC RESPONSE] T4.1 returns {return_code}: '{RETURN_CODES[return_code]}'")
-    #Return the plain text response. This is used to display the error to the GUI.
-    return RETURN_CODES[return_code]
+    print(f"[UC RESPONSE] T4.1 returns {latest_return_code}: '{RETURN_CODES[latest_return_code]}'")
 
 def ui_operations():
     """All of the code that controls the UI goes here. This code is run in a parallel thread to the main thread."""
@@ -182,10 +192,11 @@ def ui_operations():
 
     # Error window section
     # Frame that displays an error message if one exists.
-    error_ribbon = tk.Label(
+    info_ribbon = tk.Label(
         text = "test",
         font = ("Arial"),
-        bg = "red"
+        bg = "red",
+        fg = "white"
     )
 
     #"Acknowledge error" button.
@@ -194,32 +205,40 @@ def ui_operations():
         font = ("Arial")
     )
 
-    # def disable_all_interaction():
-    #     for element in interactable_elements:
-    #         element.config(state = "disabled")
+    def set_info_ribbon(is_success, return_text):
+        """Display the given return message (return_text)"""
 
-    # def enable_all_interaction():
-    #     for element in interactable_elements:
-    #         element.config(state = "enabled")
+        # start_button_state = start_button.cget("state")
+        # stop_button_state = stop_button.cget("state")
+        # save0_button_state = save0_button.cget("state")
+        # save1_button_state = save1_button.cget("state")
 
-    def set_error_ribbon(return_text):
-        """Display the given error message (return_text)"""
-        error_ribbon.config(text = return_text)
-        error_ribbon.place(x = 0, y = 600 , width = 400, height = 100)
+        # start_button.config(state = "disabled")
+        # stop_button.config(state = "disabled")
+        # save0_button.config(state = "disabled")
+        # save1_button.config(state = "disabled")
+
+        if is_success:
+            info_ribbon.config(background = "green")
+        else:
+            info_ribbon.config(background = "red")
+
+        info_ribbon.config(text = return_text)
+        info_ribbon.place(x = 0, y = 600 , width = 400, height = 100)
         ack_button.place(x = 216, y = 725, width = 150, height = 50)
 
-    def clear_error_ribbon():
-        """Hide the error frame"""
-        error_ribbon.place_forget()
+    def clear_info_ribbon():
+        """Hide the info frame"""
+        info_ribbon.place_forget()
         ack_button.place_forget()
-    #Set ack_button to trigger clear_error_ribbon when clicked
-    ack_button.config(command = clear_error_ribbon)
+    #Set ack_button to trigger clear_info_ribbon when clicked
+    ack_button.config(command = clear_info_ribbon)
 
     def test_print():
         print("This button is not yet functional.")
 
     def start_pressed():
-        """Allow the main thread to start receiving samples from the microcontroller by turning of the stop_flag."""
+        """Allow the main thread to start receiving samples from the microcontroller by turning off the stop_flag."""
         start_button.config(state = "disabled")
         stop_button.config(state = "normal")
         save0_button.config(state = "disabled")
@@ -227,7 +246,6 @@ def ui_operations():
         print("Sending 0x01 (START)")
         global stop_flag 
         stop_flag = 0
-        # wait_for_response()
 
     start_button.config(command = start_pressed)
 
@@ -240,98 +258,88 @@ def ui_operations():
         print("Sending 0x02 (STOP)")
         global stop_flag
         stop_flag = 1
-        # wait_for_response()
 
     stop_button.config(state = "disabled", command = stop_pressed)
 
-    def savew0_pressed():
-        """Tell the microcontroller to save waveform 0 to the thumbdrive."""
-        #Disable all buttons so the user can't do anything while saving.
+    def process_save_request(channel_to_save):
+        """Tell the main thread to tell the microcontroller to save a specified waveform to the thumbdrive."""
+        #Disable all buttons
         start_button.config(state = "disabled")
         stop_button.config(state = "disabled")
         save0_button.config(state = "disabled")
         save1_button.config(state = "disabled")
 
+        #Get the text entered in the file name field.
         user_provided_filename = filename_entry.get()
         #Check if the user hasn't entered a file name.
         if user_provided_filename == "":
             return_text = "Enter a file name for the file you want to create."
             print(return_text)
-            set_error_ribbon(return_text)
+            set_info_ribbon(0, return_text)
         #Check if the user entered a file name which is too long.
         elif len(user_provided_filename) > 49:
             return_text = "File names can be no longer than 50 characters."
             print(return_text)
-            set_error_ribbon(return_text)
+            set_info_ribbon(0, return_text)
         else:
-            #Send 0x03 (Save wave 0) to the microcontroller.
-            print("Sending 0x03 (OFFLOAD WAVE 0)")
-            serial_obj.reset_input_buffer()
-            serial_obj.write(b'\x03')
-            serial_obj.flush()
+            global RETURN_CODES
+            global output_buffer
+            global latest_return_code
+            global return_recv_flag
+            global save_zero_flag
+            global save_one_flag
 
-            #After receiving 0x03, the microcontroller expects a file name to be sent, so the controller knows what to name the file.
-            serial_obj.write(user_provided_filename.encode('ASCII'))
-            serial_obj.flush()
+            if channel_to_save == 0:
+                print("Sending 0x03 (OFFLOAD WAVE 0)")
+            else:
+                print("Sending 0x04 (OFFLOAD WAVE 1)")
 
-            #Wait for a respose from the microcontroller. If a response is anything other than "OK", display it to the user and log it.
-            return_text = wait_for_response()
-            if return_text != "OK":
-                set_error_ribbon(return_text)
+            #Load the output buffer with the ASCII-encoded file name so that the main thread can send it to the microcontroller.
+            output_buffer = user_provided_filename.encode('ASCII')
+
+            #Set the corresponding save flag for which channel is to be saved so the main thread can perform the relevant task.
+            if channel_to_save == 0:
+                save_zero_flag = 1
+            else:
+                save_one_flag = 1
+
+            #Wait for the return received flag to be set.
+            while not return_recv_flag:
+                continue
+
+            return_recv_flag = 0
+            
+            #Read the return code, display an error if the return is anything other than 0x00 (OK)
+            if latest_return_code != b'\x00':
+                print(RETURN_CODES[latest_return_code])
+                set_info_ribbon(0, RETURN_CODES[latest_return_code])
+            else: 
+                set_info_ribbon(1, f"Waveform {channel_to_save} was written succesfully.")
 
         #Enable buttons.
         start_button.config(state = "normal")
         stop_button.config(state = "disabled")
         save0_button.config(state = "normal")
         save1_button.config(state = "normal")
+
+    def savew0_pressed():
+        """Run the process save function with the argument of 0 to save waveform 0."""
+        process_save_request(0)
 
     save0_button.config(state = "disabled", command = savew0_pressed)
 
     def savew1_pressed():
-        """Tell the microcontroller to save waveform 1 to the thumbdrive."""
-        #Disable all buttons so the user can't do anything while saving.
-        start_button.config(state = "disabled")
-        stop_button.config(state = "disabled")
-        save0_button.config(state = "disabled")
-        save1_button.config(state = "disabled")
-
-        user_provided_filename = filename_entry.get()
-        #Check if the user hasn't entered a file name.
-        if user_provided_filename == "":
-            return_text = "Enter a file name for the file you want to create."
-            print(return_text)
-            set_error_ribbon(return_text)
-        #Check if the user entered a file name which is too long.
-        elif len(user_provided_filename) > 49:
-            return_text = "File names can be no longer than 50 characters."
-            print(return_text)
-            set_error_ribbon(return_text)
-        else:
-            #Send 0x04 (Save wave 1) to the microcontroller.
-            print("Sending 0x04 (OFFLOAD WAVE 1)")
-            serial_obj.reset_input_buffer()
-            serial_obj.write(b'\x04')
-            serial_obj.flush()
-
-            #After receiving 0x04, the microcontroller expects a file name to be sent, so the controller knows what to name the file.
-            serial_obj.write(user_provided_filename.encode('ASCII'))
-            serial_obj.flush()
-
-            #Wait for a respose from the microcontroller. If a response is anything other than "OK", display it to the user and log it.
-            return_text = wait_for_response()
-            if return_text != "OK":
-                set_error_ribbon(return_text)
-
-        #Enable buttons.
-        start_button.config(state = "normal")
-        stop_button.config(state = "disabled")
-        save0_button.config(state = "normal")
-        save1_button.config(state = "normal")
+        """"Run the process save function with the argument of 1 to save waveform 1."""
+        process_save_request(1)
 
     save1_button.config(state = "disabled", command = savew1_pressed)
 
     def validate_trig_entry(user_trigger_setting):
         """Checks that an entry to the trigger setting entry box is within +/-16.5 and doesn't have non-numeric characters"""
+
+        if user_trigger_setting == "":
+            return 0
+
         #Check for non-numeric characters
         for char in user_trigger_setting:
             if not char in VALID_CHARACTERS:
@@ -351,9 +359,11 @@ def ui_operations():
         if validate_trig_entry(user_trigger_setting) == 1:
             global trigger_setting
             trigger_setting = user_trigger_setting
+            print(f"[INFO] Trigger value is now {trigger_setting}")
+            set_info_ribbon(1, "Trigger updated")
         else:
             return_text = "Invalid input (Numbers between +/-16.5 only)."
-            set_error_ribbon(return_text)
+            set_info_ribbon(0, return_text)
 
     apply_trig_button.config(command = apply_pressed)
 
@@ -362,7 +372,6 @@ def ui_operations():
 
     #When the program reaches this point, the GUI window was closed, set the stop and terminate flags so other threads
     #   know to stop what they are doing and terminate cleanly. The mainthread handles final cleanup later.
-
     global stop_flag
     stop_flag = 1
 
@@ -371,15 +380,62 @@ def ui_operations():
 
 def display_operations():
     """All of the code that controls the display goes here. This code is run in a parallel thread to the main thread."""
-    pass #TODO 4 hunter, display code here
+    # global trigger_buffer0
+    # global trigger_buffer1
+    # global wave0
+    # global wave1
+    # trigger_buffer0 = np.copy(wave0)
+    # trigger_buffer1 = np.copy(wave1)
+
+    def find_trigger_point():
+        """Finds and returns the index of the first data point that meets the trigger requirements."""
+        global trigger_value
+        global trigger_type
+        global wave0
+        if trigger_type == "RE":
+            for j in range(1, NUM_SAMPLES):
+                if wave0[j - 1] < trigger_value and wave0[j] >= trigger_value:
+                    return j
+        elif trigger_type == "FE":
+            for j in range(1, NUM_SAMPLES):
+                if wave0[j - 1] >= trigger_value and wave0[j] < trigger_value:
+                    return j
+        elif trigger_type == "FIRST":
+            for j in range(NUM_SAMPLES):
+                if wave0[j] >= trigger_value:
+                    return j
+
+    #TODO 4 hunter, display code here
 
 def main_thread_loop():
     """This is the loop for the main thread. The main thread handles reading waveform data from the Teensy."""
+    global save_zero_flag
+    global save_one_flag
+    global stop_flag
+    global terminate_flag
+
     while True:
         if not stop_flag:
             receive_samples()
-        elif terminate_flag:
-            break;
+        else:
+            if terminate_flag:
+                break
+            elif save_zero_flag:
+                save_zero_flag = 0
+                serial_obj.reset_input_buffer()
+                serial_obj.write(b'\x03')
+                serial_obj.write(output_buffer)
+                serial_obj.flush()
+                wait_for_response()
+
+            elif save_one_flag:
+                save_one_flag = 0
+                serial_obj.reset_input_buffer()
+                serial_obj.write(b'\x04')
+                serial_obj.write(output_buffer)
+                serial_obj.flush()
+                wait_for_response()
+                
 
 #Main thread execution:
 
