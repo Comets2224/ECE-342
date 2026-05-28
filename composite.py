@@ -1,9 +1,13 @@
 import serial
 import numpy as np
 import time
-import pyqtgraph
+import pyqtgraph as pg
+from PyQt6 import QtCore, QtWidgets
 import tkinter as tk
 import threading
+import multiprocessing as mp
+from multiprocessing import shared_memory
+import sys
 
 RETURN_CODES = {
     b'\x00':"OK",
@@ -12,7 +16,8 @@ RETURN_CODES = {
 }
 
 #Sampling constants
-NUM_SAMPLES = 1250 #The number of samples in a single frame of a wave
+NUM_SAMPLES = 5000 #The number of samples used to create a wave. The number of points on the displayed wave will be HALF because of how the trigger functions.
+FINAL_FRAME_SIZE = int(NUM_SAMPLES / 2) #The actual number of points that make up a single frame of the graph. This is HALF the number of wave samples.
 TOTAL_BYTES = NUM_SAMPLES * 4 #Each sample from the Teensy contains a sample of each channel.  
 FACTOR = 3.3 / ((2**10) - 1) #FACTOR RIGHT NOW IS SET UP FOR 0V TO 3.3V SIGNALS!!!!!
 
@@ -24,24 +29,37 @@ BUTTON_WIDTH = 150
 BUTTON_HEIGHT = 50
 BUTTON_SIDE_PADDING = 400 - (2 * BUTTON_WIDTH) / 3
 VALID_CHARACTERS = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "."};
+FONT = "Univers"
 
 stop_flag = 1 #When set, the script will not query the microcontroller for samples. #When not set, python script will indefinitely request samples.
 terminate_flag = 0 #Signals that the UI has been closed by the user and that the main thread must join all other threads and terminate.
 save_zero_flag = 0
 save_one_flag = 0
 return_recv_flag = 0
+copy_request_flag = threading.Event()
+copy_complete_flag = threading.Event()
+
+wave0_visible = 1
+wave1_visible = 1
+
 latest_return_code = None
 output_buffer = None
 
 trigger_buffer0 = None
 trigger_buffer1 = None
 
+trigger_channel = 0
 trigger_setting = 0
 trigger_type = "RE"
 
 total_bytes_read = 0
-wave0 = None #The array that holds one frame of data from channel 0. Size of NUM_SAMPLES constant.
-wave1 = None #The array that holds one frame of data from channel 1. Size of NUM_SAMPLES constant.
+wave0 = np.zeros(NUM_SAMPLES) #The array that holds one frame CALCULATION of data from channel 0. Size of NUM_SAMPLES constant.
+wave1 = np.zeros(NUM_SAMPLES) #The array that holds one frame CALCULATION of data from channel 1. Size of NUM_SAMPLES constant.
+
+wave0_out = np.zeros(FINAL_FRAME_SIZE) #The array that stores the ACTUAL WAVE TO DISPLAY from channel 0, after the trigger math has been done. Size of FINAL_FRAME_SIZE.
+wave1_out = np.zeros(FINAL_FRAME_SIZE) #The array that stores the ACTUAL WAVE TO DISPLAY from channel 1, after the trigger math has been done. Size of FINAL_FRAME_SIZE.
+
+display_gui = None
 
 serial_obj = None
 
@@ -61,6 +79,8 @@ def receive_samples():
 
     while not stop_flag:
 
+        global wave0, wave0_out, wave1_out
+
         #Send command 0x01 (START) to the microcontroller, the microcontroller will send NUM_SAMPLES samples of each waveform in return.
         serial_obj.reset_input_buffer()
         serial_obj.write(b'\x01')
@@ -75,6 +95,11 @@ def receive_samples():
         wave0 = samples[0::2] * FACTOR
         wave1 = samples[1::2] * FACTOR
 
+        if copy_request_flag.is_set():
+                wave0_out = np.copy(wave0)
+                wave1_out = np.copy(wave1)
+                copy_request_flag.clear()
+                copy_complete_flag.set()
         #More debug stuff
         end = time.perf_counter()
         print(f"{total_bytes_read} bytes ({total_bytes_read / 4} samples) read and converted in {end - start:.6f} s")
@@ -101,16 +126,16 @@ def ui_operations():
     #Create the window.
     gui_window = tk.Tk()
     gui_window.title("KGH Oscilloscope Control Software")
-    gui_window.geometry("400x1080")
-    gui_window.resizable(False, False)
+    gui_window.geometry("400x1080+0+0")
+    # gui_window.resizable(False, False)
     gui_window.config(bg = BACKGROUND_COLOR)
 
     #Header at the top of the window
     name_label = tk.Label(
         text = "KGH Oscilloscope Control",
-        font = ("Arial", 25),
+        font = (FONT, 22, "italic"),
         fg = "white",
-        bg = "gray",
+        bg = "black",
     )
     name_label.place(x = 0, y = 0, width = 400, height = 50)
 
@@ -118,22 +143,22 @@ def ui_operations():
 
     sampling_header_label = tk.Label(
         text = "⎯⎯⎯⎯⎯⎯ Sampling Controls ⎯⎯⎯⎯⎯⎯",
-        font = ("Arial", 15, "bold"),
+        font = (FONT, 15, "bold"),
         bg = BACKGROUND_COLOR
     )
     sampling_header_label.place(x = 0, y = 75 , width = 400, height = 25)
 
     #"Start sampling" button
     start_button = tk.Button(
-        text = "Start Sampling",
-        font = ("Arial"),
+        text = "Start",
+        font = (FONT),
     )
     start_button.place(x = 33, y = 125, width = 150, height = 50)
 
     #"Stop sampling" button.
     stop_button = tk.Button(
-        text = "Stop Sampling",
-        font = ("Arial"),
+        text = "Stop",
+        font = (FONT),
     )
     stop_button.place(x = 216, y = 125, width = 150, height = 50)
 
@@ -141,68 +166,167 @@ def ui_operations():
 
     saving_header_label = tk.Label(
         text = "⎯⎯⎯⎯⎯⎯ Saving Controls ⎯⎯⎯⎯⎯⎯",
-        font = ("Arial", 15, "bold"),
+        font = (FONT, 15, "bold"),
         bg = BACKGROUND_COLOR
     )
     saving_header_label.place(x = 0, y = 200 , width = 400, height = 25)
 
+    filename_entry_info = tk.Label(
+        text = "Save a waveform as:",
+        font = (FONT, 12),
+        bg = BACKGROUND_COLOR
+    )
+    filename_entry_info.place(x = 0, y = 230 , width = 215, height = 20)
+
     #Textbox to enter a filename.
     filename_entry = tk.Entry(
         text = "Filename",
-        font = ("Arial", 15)
+        font = (FONT, 15)
     )
-    filename_entry.place(x = 33, y = 250, width = 333, height = 50)
+    filename_entry.place(x = 33, y = 255, width = 280, height = 50)
+
+    filetype_label = tk.Label(
+        text = ".csv",
+        font = (FONT, 15),
+        bg = BACKGROUND_COLOR
+    )
+    filetype_label.place(x = 313, y = 280 , width = 50, height = 25)
 
     #"Save waveform 0" button.
     save0_button = tk.Button(
         text = "Save Wave 0",
-        font = ("Arial"),
+        font = (FONT),
+        bg = "lightyellow"
     )
-    save0_button.place(x = 33, y = 325, width = 150, height = 50)
+    save0_button.place(x = 33, y = 330, width = 150, height = 50)
 
     #"Save waveform 1" button.
     save1_button = tk.Button(
         text = "Save Wave 1",
-        font = ("Arial"),
+        font = (FONT),
+        bg = "lightcyan"
     )
-    save1_button.place(x = 216, y = 325, width = 150, height = 50)
+    save1_button.place(x = 216, y = 330, width = 150, height = 50)
 
     #Trigger controls section
 
-    saving_header_label = tk.Label(
+    trigger_header_label = tk.Label(
         text = "⎯⎯⎯⎯⎯⎯ Trigger Controls ⎯⎯⎯⎯⎯⎯",
-        font = ("Arial", 15, "bold"),
+        font = (FONT, 15, "bold"),
         bg = BACKGROUND_COLOR
     )
-    saving_header_label.place(x = 0, y = 400 , width = 400, height = 25)
+    trigger_header_label.place(x = 0, y = 405 , width = 400, height = 25)
+
+    source_buttons_info = tk.Label(
+        text = "Source Wave (Wave that can trip the trigger):",
+        font = (FONT, 12),
+        bg = BACKGROUND_COLOR
+    )
+    source_buttons_info.place(x = 0, y = 435 , width = 380, height = 20)
+
+    source0_button = tk.Button(
+        text = "Wave 0",
+        font = (FONT),
+        state = "disabled",
+        bg = "lightyellow"
+    )
+    source0_button.place(x = 33, y = 465, width = 150, height = 50)
+
+    source1_button = tk.Button(
+        text = "Wave 1",
+        font = (FONT),
+        bg = "lightblue"
+    )
+    
+    source1_button.place(x = 216, y = 465, width = 150, height = 50)
+
+    trig_entry_info = tk.Label(
+        text = "Set the source wave to trigger at:",
+        font = (FONT, 12),
+        bg = BACKGROUND_COLOR
+    )
+    trig_entry_info.place(x = 0, y = 525 , width = 300, height = 20)
 
     #"Enter a new trigger value" textbox.
     trig_entry = tk.Entry(
         text = "Trigger Value",
-        font = ("Arial", 15)
+        font = (FONT, 15)
     )
-    trig_entry.place(x = 33, y = 450, width = 150, height = 50)
+    trig_entry.place(x = 33, y = 555, width = 80, height = 50)
+
+    unit_label = tk.Label(
+        text = "Volts",
+        font = (FONT, 15),
+        bg = BACKGROUND_COLOR
+    )
+    unit_label.place(x = 113, y = 555 , width = 75, height = 50)
 
     #"Set desired trigger value" button.
     apply_trig_button = tk.Button(
         text = "Apply",
-        font = ("Arial"),
+        font = (FONT),
     )
-    apply_trig_button.place(x = 216, y = 450, width = 150, height = 50)
+    apply_trig_button.place(x = 216, y = 555, width = 150, height = 50)
+
+    type_buttons_info = tk.Label(
+        text = "Trigger Type:",
+        font = (FONT, 12),
+        bg = BACKGROUND_COLOR
+    )
+    type_buttons_info.place(x = 0, y = 615 , width = 160, height = 20)
+
+    rise_edge_button = tk.Button(
+        text = "Rising Edge",
+        font = (FONT),
+        state = "disabled"
+    )
+    rise_edge_button.place(x = 33, y = 645, width = 150, height = 50)
+
+    fall_edge_button = tk.Button(
+        text = "Fallin' Edge",
+        font = (FONT),
+    )
+    fall_edge_button.place(x = 216, y = 645, width = 150, height = 50)
+
+    #Saving controls section
+
+    visibility_header_label = tk.Label(
+        text = "⎯⎯⎯⎯⎯⎯ Visibility Controls ⎯⎯⎯⎯⎯⎯",
+        font = (FONT, 15, "bold"),
+        bg = BACKGROUND_COLOR
+    )
+    visibility_header_label.place(x = 0, y = 720 , width = 400, height = 25)
+
+    #"Start sampling" button
+    wave0_toggle_button = tk.Button(
+        text = "Wave 0 Toggle",
+        font = (FONT),
+        bg = "lightyellow"
+    )
+    wave0_toggle_button.place(x = 33, y = 770, width = 150, height = 50)
+
+    #"Stop sampling" button.
+    wave1_toggle_button = tk.Button(
+        text = "Wave 1 Toggle",
+        font = (FONT),
+        bg = "lightblue"
+    )
+    wave1_toggle_button.place(x = 216, y = 770, width = 150, height = 50)
 
     # Error window section
     # Frame that displays an error message if one exists.
     info_ribbon = tk.Label(
         text = "test",
-        font = ("Arial"),
+        font = (FONT),
         bg = "red",
-        fg = "white"
+        fg = "white",
+        wraplength = 350
     )
 
     #"Acknowledge error" button.
     ack_button = tk.Button(
         text = "OK",
-        font = ("Arial")
+        font = (FONT)
     )
 
     def set_info_ribbon(is_success, return_text):
@@ -219,13 +343,14 @@ def ui_operations():
         # save1_button.config(state = "disabled")
 
         if is_success:
-            info_ribbon.config(background = "green")
+            info_ribbon.config(background = "green", fg = "white")
+            info_ribbon.config(text = return_text)
         else:
-            info_ribbon.config(background = "red")
+            info_ribbon.config(background = "yellow", fg = "black")
+            info_ribbon.config(text = f"⚠ {return_text}")
 
-        info_ribbon.config(text = return_text)
-        info_ribbon.place(x = 0, y = 600 , width = 400, height = 100)
-        ack_button.place(x = 216, y = 725, width = 150, height = 50)
+        info_ribbon.place(x = 0, y = 835 , width = 400, height = 100)
+        ack_button.place(x = 216, y = 920, width = 150, height = 50)
 
     def clear_info_ribbon():
         """Hide the info frame"""
@@ -243,6 +368,12 @@ def ui_operations():
         stop_button.config(state = "normal")
         save0_button.config(state = "disabled")
         save1_button.config(state = "disabled")
+        apply_trig_button.config(state = "disabled")
+        rise_edge_button.config(state = "disabled")
+        fall_edge_button.config(state = "disabled")
+        source0_button.config(state = "disabled")
+        source1_button.config(state = "disabled")
+
         print("Sending 0x01 (START)")
         global stop_flag 
         stop_flag = 0
@@ -251,13 +382,26 @@ def ui_operations():
 
     def stop_pressed():
         """Stop the main thread from receiving samples from the microcontroller by setting the stop_flag."""
+
+        print("Sending 0x02 (STOP)")
+        global stop_flag
+        stop_flag = 1
+
         start_button.config(state = "normal")
         stop_button.config(state = "disabled")
         save0_button.config(state = "normal")
         save1_button.config(state = "normal")
-        print("Sending 0x02 (STOP)")
-        global stop_flag
-        stop_flag = 1
+        apply_trig_button.config(state = "normal")
+
+        if trigger_type == "RE":
+            fall_edge_button.config(state = "normal")
+        else:
+            rise_edge_button.config(state = "normal")
+
+        if trigger_channel == 0:
+            source1_button.config(state = "normal")
+        else:
+            source0_button.config(state = "normal")
 
     stop_button.config(state = "disabled", command = stop_pressed)
 
@@ -358,14 +502,68 @@ def ui_operations():
         user_trigger_setting = trig_entry.get()
         if validate_trig_entry(user_trigger_setting) == 1:
             global trigger_setting
-            trigger_setting = user_trigger_setting
+            trigger_setting = float(user_trigger_setting)
             print(f"[INFO] Trigger value is now {trigger_setting}")
-            set_info_ribbon(1, "Trigger updated")
+            set_info_ribbon(1, f"Trigger updated to {trigger_setting}V.")
         else:
-            return_text = "Invalid input (Numbers between +/-16.5 only)."
+            return_text = "Invalid input \n (Voltages between +/-16.5V only)."
             set_info_ribbon(0, return_text)
 
     apply_trig_button.config(command = apply_pressed)
+
+    def channel0_source_pressed():
+        global trigger_channel
+        trigger_channel = 0
+        source0_button.config(state = "disabled")
+        source1_button.config(state = "normal")
+
+    source0_button.config(command = channel0_source_pressed)
+
+    def channel1_source_pressed():
+        global trigger_channel
+        trigger_channel = 1
+        source0_button.config(state = "normal")
+        source1_button.config(state = "disabled")
+
+    source1_button.config(command = channel1_source_pressed)
+
+    def rise_button_pressed():
+        global trigger_type
+        trigger_type = "RE"
+        rise_edge_button.config(state = "disabled")
+        fall_edge_button.config(state = "normal")
+
+    rise_edge_button.config(command = rise_button_pressed)
+
+    def fall_button_pressed():
+        global trigger_type
+        trigger_type = "FE"
+        rise_edge_button.config(state = "normal")
+        fall_edge_button.config(state = "disabled")
+
+    fall_edge_button.config(command = fall_button_pressed)
+
+    def toggle_wave0_pressed():
+        global display_gui, wave0_visible
+        if wave0_visible:
+            wave0_visible = 0
+            display_gui.channel0_line.hide()
+        else:
+            wave0_visible = 1
+            display_gui.channel0_line.show()
+
+    wave0_toggle_button.config(command = toggle_wave0_pressed)
+
+    def toggle_wave1_pressed():
+        global display_gui, wave1_visible
+        if wave1_visible:
+            wave1_visible = 0
+            display_gui.channel1_line.hide()
+        else:
+            wave1_visible = 1
+            display_gui.channel1_line.show()
+
+    wave1_toggle_button.config(command = toggle_wave1_pressed)
 
     #Run the mainloop, which is an infinite loop that detects inputs and handles them
     gui_window.mainloop()
@@ -378,34 +576,92 @@ def ui_operations():
     global terminate_flag
     terminate_flag = 1
 
-def display_operations():
-    """All of the code that controls the display goes here. This code is run in a parallel thread to the main thread."""
-    # global trigger_buffer0
-    # global trigger_buffer1
-    # global wave0
-    # global wave1
-    # trigger_buffer0 = np.copy(wave0)
-    # trigger_buffer1 = np.copy(wave1)
-
-    def find_trigger_point():
+def find_trigger_point(trigger_channel):
         """Finds and returns the index of the first data point that meets the trigger requirements."""
-        global trigger_value
+        global trigger_setting
         global trigger_type
         global wave0
-        if trigger_type == "RE":
-            for j in range(1, NUM_SAMPLES):
-                if wave0[j - 1] < trigger_value and wave0[j] >= trigger_value:
-                    return j
-        elif trigger_type == "FE":
-            for j in range(1, NUM_SAMPLES):
-                if wave0[j - 1] >= trigger_value and wave0[j] < trigger_value:
-                    return j
-        elif trigger_type == "FIRST":
-            for j in range(NUM_SAMPLES):
-                if wave0[j] >= trigger_value:
-                    return j
+        global wave1
 
-    #TODO 4 hunter, display code here
+        if trigger_channel == 0:
+            if trigger_type == "RE":
+                for j in range(1, NUM_SAMPLES):
+                    if wave0[j - 1] < trigger_setting and wave0[j] >= trigger_setting:
+                        return j
+            else:
+                for j in range(1, NUM_SAMPLES):
+                    if wave0[j - 1] >= trigger_setting and wave0[j] < trigger_setting:
+                        return j
+        else:
+            if trigger_type == "RE":
+                for j in range(1, NUM_SAMPLES):
+                    if wave1[j - 1] < trigger_setting and wave1[j] >= trigger_setting:
+                        return j
+            else:
+                for j in range(1, NUM_SAMPLES):
+                    if wave1[j - 1] >= trigger_setting and wave1[j] < trigger_setting:
+                        return j
+
+class LiveGraph(QtWidgets.QMainWindow):
+    #TODO 4 hunter, any other display code from your implementation goes here!!!!
+    def __init__(self):
+        super().__init__()
+        
+        global wave0_out
+        global wave1_out
+
+        # 1. Initialize the PlotWidget
+        self.graphWidget = pg.PlotWidget()
+        self.setCentralWidget(self.graphWidget)
+        self.setGeometry(325, 30, 1210, 785)
+        
+        #self.graphWidget.setBackground('w')
+        #pen = pg.mkPen(color=(255, 0, 0))
+        self.channel0_line = self.graphWidget.plot(wave0_out, pen='y')
+        self.channel1_line = self.graphWidget.plot(wave1_out, pen='c')
+        
+        # 2. Setup the Timer
+        self.timer = QtCore.QTimer()
+        self.timer.setInterval(20) # Update every 20ms
+        self.timer.timeout.connect(self.update_plot_data)
+        self.timer.start()
+
+    def update_plot_data(self):
+        global stop_flag
+        if stop_flag:
+            return
+
+        global copy_request_flag
+        global wave0_out
+        global wave1_out
+
+        source_wave = None
+        other_wave = None
+
+        if trigger_channel == 0:
+            source_wave = wave0_out
+            other_wave = wave1_out
+        else:
+            source_wave = wave1_out
+            other_wave = wave0_out
+
+        copy_request_flag.set()
+        copy_complete_flag.wait()
+        copy_complete_flag.clear()
+
+        trigger_index = find_trigger_point(trigger_channel)
+        if trigger_index is not None:
+            source_wave = source_wave[trigger_index:trigger_index + FINAL_FRAME_SIZE:1]
+        else:
+            source_wave = source_wave[0:FINAL_FRAME_SIZE:1]
+
+        if trigger_channel == 0:
+            self.channel0_line.setData(source_wave)
+            self.channel1_line.setData(other_wave[0:FINAL_FRAME_SIZE:1])
+        else:
+            self.channel0_line.setData(other_wave[0:FINAL_FRAME_SIZE:1])
+            self.channel1_line.setData(source_wave)
+        # self.graphWidget.setY(16.5)
 
 def main_thread_loop():
     """This is the loop for the main thread. The main thread handles reading waveform data from the Teensy."""
@@ -413,6 +669,7 @@ def main_thread_loop():
     global save_one_flag
     global stop_flag
     global terminate_flag
+    global copy_request_flag
 
     while True:
         if not stop_flag:
@@ -435,13 +692,13 @@ def main_thread_loop():
                 serial_obj.write(output_buffer)
                 serial_obj.flush()
                 wait_for_response()
-                
 
 #Main thread execution:
 
 #Create the UI Thread and Display Thread
 ui_thread = threading.Thread(target = ui_operations)
-display_thread = threading.Thread(target = display_operations)
+#display_thread = threading.Thread(target = display_operations)
+comm_thread = threading.Thread(target = main_thread_loop)
 
 #Open communication with Teensy
 serial_obj = serial.Serial('COM7', 6000000, timeout=10)
@@ -449,12 +706,19 @@ serial_obj = serial.Serial('COM7', 6000000, timeout=10)
 #Start up all threads.
 print(f"\n=====  Connected to: {serial_obj.name} at {serial_obj.baudrate} baud  =====\n")
 ui_thread.start()
-display_thread.start()
-main_thread_loop()
+comm_thread.start()
+#display_thread.start()
+#main_thread_loop()
+
+app = QtWidgets.QApplication(sys.argv)
+display_gui = LiveGraph()
+display_gui.show()
+app.exec()
 
 #Close the UI and Display threads
 ui_thread.join()
-display_thread.join()
+comm_thread.join()
+#display_thread.join()
 
 #Close communication with Teensy
 serial_obj.close()
